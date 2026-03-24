@@ -12,6 +12,7 @@ from pesq import pesq as pesq_backend  # ✅ use library PESQ safely
 import time
 from multiprocessing import Pool, cpu_count, get_context
 import stoi_test as st
+from typing import Any, Dict, List, Optional, Tuple, Union
 try:
     import pypapi
     from pypapi import events
@@ -38,8 +39,10 @@ except Exception as e:
     get_speech_timestamps = None
 
 
-def log_metric(metric_name, value, avg_value=None, log_dir="logs", rt=None, distance=None,type="output"):
-    
+def log_metric(metric_name: str, value: float, avg_value: Optional[float] = None,
+               log_dir: str = "logs", rt: Optional[float] = None,
+               distance: Optional[float] = None, type: str = "output") -> None:
+    """Append one scalar metric to a log file for post-processing."""
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"{rt}_ReTM_{metric_name.lower()}_{distance}_{type}_log.txt")
     num=0
@@ -50,11 +53,10 @@ def log_metric(metric_name, value, avg_value=None, log_dir="logs", rt=None, dist
         if avg_value is not None:
             f.write(f"    → Current average {metric_name.upper()}: {avg_value:.4f}\n")
 
-def compute_pesq(ref, deg, sr):
-    """
-    Unified PESQ function that safely handles clipping, 1D conversion, and short signal checks.
-    Returns np.nan if computation fails or signal too short.
-    """
+def compute_pesq(ref: Union[np.ndarray, List[float]],
+                  deg: Union[np.ndarray, List[float]],
+                  sr: int) -> float:
+    """Compute PESQ score, returning float or np.nan if unavailable."""
     mode = 'wb' if sr > 48000 else 'nb'
 
     ref = np.asarray(ref, dtype=np.float32)
@@ -83,12 +85,12 @@ def compute_pesq(ref, deg, sr):
         return np.nan
 
 
-def compute_mel_distance(ref, deg, sr, n_mels=128, fmax=8000):
-    """
-    Compute mel spectrogram distance between reference and degraded signals.
-    Returns the mean squared error between mel spectrograms in dB scale.
-    Lower values indicate better quality.
-    """
+def compute_mel_distance(ref: Union[np.ndarray, List[float]],
+                          deg: Union[np.ndarray, List[float]],
+                          sr: int,
+                          n_mels: int = 128,
+                          fmax: int = 8000) -> float:
+    """Compute mel-spectrogram MSE distance (dB domain)."""
     ref = np.asarray(ref, dtype=np.float32)
     deg = np.asarray(deg, dtype=np.float32)
 
@@ -118,11 +120,10 @@ def compute_mel_distance(ref, deg, sr, n_mels=128, fmax=8000):
         return np.nan
 # Helpers: STFT / ISTFT wrappers
 # ---------------------------
-def stft_multi_from_array(audio_arr, n_fft=N_FFT, hop_length=HOP):
-    """
-    audio_arr: array shape (C, samples) OR (samples, C) — this function expects (C, samples)
-    returns: X_stft shape (C, F, T) complex
-    """
+def stft_multi_from_array(audio_arr: Union[np.ndarray, List[float]],
+                          n_fft: int = N_FFT,
+                          hop_length: int = HOP) -> np.ndarray:
+    """Compute multi-channel STFT and return (C, F, T) complex array."""
     audio = np.asarray(audio_arr)
     if audio.ndim == 2 and audio.shape[0] < audio.shape[1]:
         # assume shape (C, samples)
@@ -140,14 +141,21 @@ def stft_multi_from_array(audio_arr, n_fft=N_FFT, hop_length=HOP):
         X_list.append(X)
     return np.stack(X_list, axis=0)  # (C, F, T)
 
-def istft_from_stft_matrix(S, hop_length=HOP, win_length=N_FFT):
+def istft_from_stft_matrix(S: np.ndarray,
+                            hop_length: int = HOP,
+                            win_length: int = N_FFT) -> np.ndarray:
+    """Inverse STFT on a single channel matrix (F, T)."""
     # S shape (F, T) (librosa uses shape (n_fft/2+1, frames))
     return librosa.istft(S, hop_length=hop_length, win_length=win_length, window=WIN, center=True)
 
 # ---------------------------
 # VAD wrapper (returns non-speech segments in samples)
 # ---------------------------
-def perform_vad(audio_path, vad_model, vad_threshold=4.0, min_silence_duration=0.05):
+def perform_vad(audio_path: str,
+                vad_model: Optional[Any],
+                vad_threshold: float = 4.0,
+                min_silence_duration: float = 0.05) -> Tuple[List[Dict[str, int]], int]:
+    """Run VAD and return list of non-speech segments and sample rate."""
     audio, sr = librosa.load(audio_path, sr=None, mono=True)
     audio_int16 = (audio * 32767).astype(np.int16)
     if vad_model is None or get_speech_timestamps is None:
@@ -178,9 +186,15 @@ def perform_vad(audio_path, vad_model, vad_threshold=4.0, min_silence_duration=0
 
 
 # ---------------------------
-def estimate_retm_freq(A_in, B_in, sr=SAMPLE_RATE,
-                       window_dur=2.0, overlap=0.75, reg_scale=1e-1,
-                       min_frames_per_window=4, debug=False):
+def estimate_retm_freq(A_in: Union[np.ndarray, List[float]],
+                       B_in: Union[np.ndarray, List[float]],
+                       sr: int = SAMPLE_RATE,
+                       window_dur: float = 2.0,
+                       overlap: float = 0.75,
+                       reg_scale: float = 1e-1,
+                       min_frames_per_window: int = 4,
+                       debug: bool = False) -> List[np.ndarray]:
+    """Estimate frequency-dependent ReTM gain Wf windows for multi-channel input."""
     A_in = np.asarray(A_in)
     B_in = np.asarray(B_in)
     if A_in.ndim != 2 or B_in.ndim != 2:
@@ -283,9 +297,13 @@ def estimate_retm_freq(A_in, B_in, sr=SAMPLE_RATE,
 # Denoising: apply Wf (averaged) to full file STFT
 #   Wf: either (F, n_err, n_ref) or list of such - we'll accept both; if list, we average
 # ---------------------------
-def denoise_signal_freq_from_Wf(audio_arr, Wf, ref_channels=REF_CHANNELS, target_channels=TARGET_CHANNELS,
-                                n_fft=N_FFT, hop_length=HOP):
-   
+def denoise_signal_freq_from_Wf(audio_arr: Union[np.ndarray, List[float]],
+                                Wf: Union[np.ndarray, List[np.ndarray]],
+                                ref_channels: List[int] = REF_CHANNELS,
+                                target_channels: List[int] = TARGET_CHANNELS,
+                                n_fft: int = N_FFT,
+                                hop_length: int = HOP) -> np.ndarray:
+    """Apply ReTM frequency-domain filter Wf to multi-channel audio and return denoised targets."""
     audio = np.asarray(audio_arr)
     # convert to (C, samples)
     if audio.ndim == 2 and audio.shape[0] < audio.shape[1]:
@@ -348,20 +366,20 @@ def denoise_signal_freq_from_Wf(audio_arr, Wf, ref_channels=REF_CHANNELS, target
 
 
 def process_folder_and_eval(
-    input_folder,
-    clean_folder,
-    output_folder,
-    start_index=0,
-    num_files=60,
-    window_avg=2.0,
-    reg_scale=1e-1,
-    sr=16000,
-    debug=False,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    num_workers=1,
-    rt=0.4,
-    distance=1.1
-):
+    input_folder: str,
+    clean_folder: str,
+    output_folder: str,
+    start_index: int = 0,
+    num_files: int = 60,
+    window_avg: float = 2.0,
+    reg_scale: float = 1e-1,
+    sr: int = 16000,
+    debug: bool = False,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    num_workers: Optional[int] = 1,
+    rt: float = 0.4,
+    distance: float = 1.1
+) -> None:
     os.makedirs(output_folder, exist_ok=True)
     noisy_scores, denoised_scores = [], []
     stoi_noisy_scores, stoi_denoised_scores = [], []
@@ -555,7 +573,8 @@ def process_folder_and_eval(
 
 
 
-def safe_metric_call(func, *args, **kwargs):
+def safe_metric_call(func: Any, *args: Any, **kwargs: Any) -> float:
+    """Call metric function safely, returning NaN on failure."""
     try:
         value = func(*args, **kwargs)
         if isinstance(value, np.ndarray):
@@ -576,13 +595,18 @@ def safe_metric_call(func, *args, **kwargs):
 # ---------------------------
 # GFLOP computation helpers
 # ---------------------------
-def estimate_retm_flops(n_channels, n_samples, n_fft, hop_length, n_freq_bins, n_time_frames):
-    """
-    Estimate FLOPs for ReTM algorithm operations:
+def estimate_retm_flops(n_channels: int,
+                         n_samples: int,
+                         n_fft: int,
+                         hop_length: int,
+                         n_freq_bins: int,
+                         n_time_frames: int) -> int:
+    """Estimate FLOPs for ReTM algorithm operations.
+
     - STFT: ~5 * n_fft * log(n_fft) * num_frames (FFT cost)
     - Wiener filter estimation: matrix ops at each freq bin
     - ISTFT: ~5 * n_fft * log(n_fft) * num_frames
-    
+
     Returns: estimated FLOPs as integer
     """
     # FFT cost per channel (assuming ~5 ops per FFT butterfly)
@@ -610,7 +634,7 @@ def estimate_retm_flops(n_channels, n_samples, n_fft, hop_length, n_freq_bins, n
     return max(total_flops, 0)
 
 
-def start_gflop_counter():
+def start_gflop_counter() -> bool:
     """Start PAPI FP operations counter if available."""
     if PYPAPI_AVAILABLE:
         try:
@@ -623,7 +647,7 @@ def start_gflop_counter():
     return False
 
 
-def stop_gflop_counter():
+def stop_gflop_counter() -> int:
     """Stop PAPI counter and return FLOPs count."""
     if PYPAPI_AVAILABLE:
         try:
@@ -639,14 +663,19 @@ def stop_gflop_counter():
 # ---------------------------
 # GMAC computation helpers
 # ---------------------------
-def estimate_retm_gmacs(n_channels, n_samples, n_fft, hop_length, n_freq_bins, n_time_frames):
-    """
-    Estimate MACs (Multiply-Accumulate operations) for ReTM algorithm.
+def estimate_retm_gmacs(n_channels: int,
+                         n_samples: int,
+                         n_fft: int,
+                         hop_length: int,
+                         n_freq_bins: int,
+                         n_time_frames: int) -> int:
+    """Estimate MACs (Multiply-Accumulate operations) for ReTM algorithm.
+
     GMAC = Giga MACs = MACs / 1e9
-    
+
     Each FFT operation ~= log2(N) * N/2 MACs
     Each matrix multiply (A @ B): m*n*k MACs for shape (m,k) @ (k,n)
-    
+
     Returns: estimated MACs as integer
     """
     # FFT/IFFT: ~(n_fft/2) * log2(n_fft) MACs per FFT
@@ -679,7 +708,7 @@ def estimate_retm_gmacs(n_channels, n_samples, n_fft, hop_length, n_freq_bins, n
     return max(int(total_macs), 0)
 
 
-def compute_gmacs_per_second(macs, elapsed_time_sec):
+def compute_gmacs_per_second(macs: int, elapsed_time_sec: float) -> float:
     """Convert MACs and elapsed time to GMACs/s."""
     if elapsed_time_sec <= 0:
         return 0.0
@@ -689,9 +718,16 @@ def compute_gmacs_per_second(macs, elapsed_time_sec):
 # ---------------------------
 # Single-file processing helpers (serial & worker)
 # ---------------------------
-def _process_single_file_worker(noisy_path, clean_path, denoised_path, sr, reg_scale, debug, rt, distance):
-    """
-    Worker-safe single-file processing. Intended to be called in a separate process.
+def _process_single_file_worker(noisy_path: str,
+                                clean_path: str,
+                                denoised_path: str,
+                                sr: int,
+                                reg_scale: float,
+                                debug: bool,
+                                rt: float,
+                                distance: float) -> Optional[Dict[str, Any]]:
+    """Worker-safe single-file processing. Intended to be called in a separate process.
+
     Returns a dict with metrics and timing information (or None on failure).
     """
     try:
@@ -829,7 +865,9 @@ def _process_single_file_worker(noisy_path, clean_path, denoised_path, sr, reg_s
         return None
 
 
-def _process_single_file(noisy_path, clean_path, denoised_path, sr, reg_scale, debug, device, rt, distance):
+def _process_single_file(noisy_path: str, clean_path: str, denoised_path: str,
+                         sr: int, reg_scale: float, debug: bool,
+                         device: str, rt: float, distance: float) -> Dict[str, Any]:
     """In-process single-file wrapper that uses the worker logic but allows GPU device selection for non-parallel runs."""
     t0 = time.time()
     # If device is not CPU, we still call the same worker flow but allow torch to use device where applicable.
