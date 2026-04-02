@@ -29,6 +29,41 @@ import time
 import csv
 import torch
 
+def calculate_stoi_multichannel(ref, deg, sr, extended=False):
+    """
+    Compute average STOI or ESTOI for multichannel signals.
+    Ensures ref and deg are aligned and same length.
+    """
+    # Load if file paths
+    if isinstance(ref, str):
+        ref, _ = librosa.load(ref, sr=sr, mono=False)
+    if isinstance(deg, str):
+        deg, _ = librosa.load(deg, sr=sr, mono=False)
+    
+    # Ensure 2D shape
+    if ref.ndim == 1:
+        ref = ref[:, np.newaxis]
+    if deg.ndim == 1:
+        deg = deg[:, np.newaxis]
+
+    # Match channels
+    min_ch = min(ref.shape[1], deg.shape[1])
+    ref, deg = ref[:, :min_ch], deg[:, :min_ch]
+
+    # Align time length (crop or pad clean to match denoised)
+    ref, deg = align_signals(ref, deg)
+
+    scores = []
+    for ch in range(min_ch):
+        try:
+            assert len(ref) == len(deg), f"Length mismatch after alignment: {len(ref)} vs {len(deg)}"
+
+            score = stoi(ref[:, ch], deg[:, ch], sr, extended=extended)
+            scores.append(score)
+        except Exception as e:
+            print(f"⚠️ STOI error on channel {ch}: {e}")
+
+    return float(np.mean(scores)) if scores else np.nan
 # Force single-threaded PyTorch for reproducible single-core runs
 try:
     torch.set_num_threads(1)
@@ -325,7 +360,21 @@ else:
     print('\nNo metrics collected; no files processed.')
 
 
-
+def align_signals(clean, denoised):
+    """
+    Align clean and denoised signals to have identical length.
+    Crops or pads the clean signal to match denoised length.
+    """
+    min_len = min(len(clean), len(denoised))
+    max_len = max(len(clean), len(denoised))
+    
+    if len(clean) > len(denoised):
+        clean = clean[:len(denoised)]
+    elif len(clean) < len(denoised):
+        pad = np.zeros(len(denoised) - len(clean))
+        clean = np.concatenate([clean, pad])
+    
+    return clean, denoised[:len(clean)]
 
 ##############
 ###PESQ and STOI/ESTOI evaluation
